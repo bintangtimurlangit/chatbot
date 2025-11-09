@@ -69,7 +69,7 @@ class ChatRequest(BaseModel):
     user_id: str
     platform: str  # 'whatsapp' or 'instagram'
     message: str
-    use_knowledge_base: bool = True
+    use_knowledge_base: bool = True  # Always enforced in strict mode
 
 
 class ChatResponse(BaseModel):
@@ -142,33 +142,54 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     try:
         context_manager = ContextManager(db)
         
-        # Get conversation history
-        history = context_manager.get_conversation_history(
+        # Get conversation history from last 24 hours
+        history = context_manager.get_recent_context(
             user_id=request.user_id,
             platform=request.platform,
-            limit=8  # Last 8 messages for context
+            hours=24  # Last 24 hours of context
         )
         
-        # Build system prompt
-        system_prompt = """Kamu adalah asisten chatbot yang ramah dan membantu. 
-Jawab semua pertanyaan dalam Bahasa Indonesia dengan sopan dan jelas.
-Jika ada informasi dari knowledge base, gunakan informasi tersebut untuk menjawab dengan akurat.
-Jika tidak ada informasi yang relevan, jawab berdasarkan pengetahuanmu sendiri."""
+        # Build system prompt - STRICT mode: Only use knowledge base
+        system_prompt = """Kamu adalah asisten chatbot resmi untuk layanan KSJPS dan JPD Kota Yogyakarta.
+
+ATURAN PENTING:
+- HANYA jawab pertanyaan tentang KSJPS, JPD, dan layanan Dinsosnakertrans Kota Yogyakarta
+- WAJIB gunakan informasi dari knowledge base yang diberikan
+- Jika pertanyaan di luar topik KSJPS/JPD, katakan: "Maaf, saya hanya dapat membantu pertanyaan seputar KSJPS dan JPD. Silakan hubungi Dinsosnakertrans Kota Yogyakarta untuk informasi lainnya."
+- Jangan jawab pertanyaan umum, chitchat, atau topik lain
+- Selalu sopan dan profesional dalam Bahasa Indonesia"""
         
-        # Search knowledge base if enabled
+        # ALWAYS search knowledge base (enforced for strict mode)
         knowledge_context = ""
         sources_count = 0
-        if request.use_knowledge_base:
-            try:
-                knowledge_context = await rag_service.build_context(
-                    query=request.message,
-                    max_results=3
+        try:
+            # Search for relevant knowledge
+            search_results = await rag_service.search_knowledge_base(request.message, limit=3)
+            sources_count = len(search_results)
+            
+            # If NO relevant knowledge found, reject the question
+            if sources_count == 0:
+                return ChatResponse(
+                    response="Maaf, saya hanya dapat membantu pertanyaan seputar KSJPS (Keluarga Sasaran Jaminan Perlindungan Sosial) dan JPD (Jaminan Pendidikan Daerah) di Kota Yogyakarta. Untuk informasi lainnya, silakan hubungi Dinsosnakertrans Kota Yogyakarta di nomor telepon atau datang langsung ke kantor.",
+                    timestamp=datetime.now().isoformat(),
+                    sources_used=0
                 )
-                if knowledge_context:
-                    sources_count = len(await rag_service.search_knowledge_base(request.message, limit=3))
-                    system_prompt += f"\n\n{knowledge_context}"
-            except Exception as e:
-                print(f"RAG search error: {e}")
+            
+            # Build context from knowledge base
+            knowledge_context = await rag_service.build_context(
+                query=request.message,
+                max_results=3
+            )
+            if knowledge_context:
+                system_prompt += f"\n\n{knowledge_context}"
+        except Exception as e:
+            print(f"RAG search error: {e}")
+            # If RAG fails, also reject to be safe
+            return ChatResponse(
+                response="Maaf, sistem sedang mengalami kendala. Silakan coba lagi atau hubungi Dinsosnakertrans Kota Yogyakarta.",
+                timestamp=datetime.now().isoformat(),
+                sources_used=0
+            )
         
         # Build messages for AI
         messages = [{"role": "system", "content": system_prompt}]
@@ -229,12 +250,12 @@ async def webhook_message(webhook_data: WebhookMessage, db: Session = Depends(ge
     n8n will call this endpoint when a message is received
     """
     try:
-        # Create chat request
+        # Create chat request (knowledge base always enforced)
         chat_request = ChatRequest(
             user_id=webhook_data.user_id,
             platform=webhook_data.platform,
             message=webhook_data.message,
-            use_knowledge_base=True
+            use_knowledge_base=True  # Always true for strict mode
         )
         
         # Process the message
@@ -369,3 +390,37 @@ async def list_users(db: Session = Depends(get_db)):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+# Admin/Maintenance endpoints
+@app.post("/admin/cleanup-old-conversations")
+async def cleanup_old_conversations(days: int = 90, db: Session = Depends(get_db)):
+    """
+    Delete conversations older than specified days (default: 90 days)
+    This helps with GDPR compliance and database management
+    """
+    try:
+        from datetime import timedelta
+        cutoff_date = datetime.now() - timedelta(days=days)
+        
+        # Count first
+        count = db.query(Conversation).filter(
+            Conversation.timestamp < cutoff_date
+        ).count()
+        
+        # Delete
+        deleted = db.query(Conversation).filter(
+            Conversation.timestamp < cutoff_date
+        ).delete()
+        
+        db.commit()
+        
+        return {
+            "status": "success",
+            "deleted_count": deleted,
+            "cutoff_date": cutoff_date.isoformat(),
+            "retention_days": days
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Cleanup error: {str(e)}")

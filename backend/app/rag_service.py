@@ -14,7 +14,7 @@ class RAGService:
         self, 
         query: str, 
         limit: int = 5,
-        score_threshold: float = 0.3
+        score_threshold: float = 0.5
     ) -> List[Dict]:
         """Search knowledge base for relevant information"""
         # Generate query embedding
