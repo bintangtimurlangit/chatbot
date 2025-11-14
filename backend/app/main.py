@@ -424,3 +424,32 @@ async def cleanup_old_conversations(days: int = 90, db: Session = Depends(get_db
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Cleanup error: {str(e)}")
+
+
+@app.post("/admin/clear-all-contexts")
+async def clear_all_contexts(db: Session = Depends(get_db)):
+    """
+    Delete ALL conversation history for all users
+    Keeps user records intact, only clears conversation messages
+    Useful for testing or complete system reset
+    """
+    try:
+        # Count total conversations before deletion
+        total_conversations = db.query(Conversation).count()
+        total_users = db.query(User).count()
+        
+        # Delete all conversations (CASCADE will handle relationships)
+        deleted = db.query(Conversation).delete()
+        
+        db.commit()
+        
+        return {
+            "status": "success",
+            "message": "All conversation contexts cleared",
+            "conversations_deleted": deleted,
+            "users_retained": total_users,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Clear contexts error: {str(e)}")
