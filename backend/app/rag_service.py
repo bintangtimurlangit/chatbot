@@ -17,17 +17,30 @@ class RAGService:
         score_threshold: float = 0.5
     ) -> List[Dict]:
         """Search knowledge base for relevant information"""
-        # Generate query embedding
-        query_embedding = await self.embeddings.generate_embedding(query)
-        
-        # Search Qdrant
-        results = self.qdrant.search(
-            query_embedding=query_embedding,
-            limit=limit,
-            score_threshold=score_threshold
-        )
-        
-        return results
+        try:
+            # Generate query embedding
+            query_embedding = await self.embeddings.generate_embedding(query)
+            
+            # Validate embedding before searching
+            if not query_embedding or len(query_embedding) != self.embeddings.dimension:
+                print(f"RAG search error: Invalid embedding generated. Dimension: {len(query_embedding) if query_embedding else 0}, Expected: {self.embeddings.dimension}")
+                return []
+            
+            # Search Qdrant
+            results = self.qdrant.search(
+                query_embedding=query_embedding,
+                limit=limit,
+                score_threshold=score_threshold
+            )
+            
+            return results
+        except ValueError as e:
+            # Invalid embedding dimension
+            print(f"RAG search error: {e}")
+            return []
+        except Exception as e:
+            print(f"RAG search error: {e}")
+            return []
     
     async def build_context(
         self, 

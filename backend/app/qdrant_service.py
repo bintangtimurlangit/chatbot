@@ -69,6 +69,12 @@ class QdrantService:
         score_threshold: float = 0.7
     ) -> List[Dict]:
         """Search for similar documents"""
+        # Validate embedding dimension before searching
+        if not query_embedding or len(query_embedding) != self.embedding_dimension:
+            error_msg = f"Invalid query embedding dimension: expected {self.embedding_dimension}, got {len(query_embedding) if query_embedding else 0}"
+            print(f"Qdrant search error: {error_msg}")
+            raise ValueError(error_msg)
+        
         results = self.client.search(
             collection_name=self.collection_name,
             query_vector=query_embedding,

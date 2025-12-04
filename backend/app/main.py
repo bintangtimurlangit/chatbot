@@ -6,6 +6,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 import httpx
 import os
+import hashlib
+import redis
 from datetime import datetime
 from contextlib import asynccontextmanager
 
@@ -17,6 +19,16 @@ from .models import User, Conversation
 
 # Initialize RAG service
 rag_service = RAGService()
+
+# Initialize Redis for deduplication
+redis_url = os.getenv("REDIS_URL", "redis://redis:6379")
+try:
+    redis_client = redis.from_url(redis_url, decode_responses=True)
+    redis_client.ping()
+    print("Redis connected for deduplication")
+except Exception as e:
+    print(f"Redis connection warning: {e}. Deduplication disabled.")
+    redis_client = None
 
 
 @asynccontextmanager
@@ -139,6 +151,7 @@ async def health_check(db: Session = Depends(get_db)):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     """Main chat endpoint with RAG support"""
+    print(f"Chat request received: user_id={request.user_id}, platform={request.platform}, message_length={len(request.message)}")
     try:
         context_manager = ContextManager(db)
         
@@ -163,7 +176,7 @@ ATURAN PENTING:
         knowledge_context = ""
         sources_count = 0
         try:
-            # Search for relevant knowledge
+            # Search for relevant knowledge (only once!)
             search_results = await rag_service.search_knowledge_base(request.message, limit=3)
             sources_count = len(search_results)
             
@@ -175,15 +188,21 @@ ATURAN PENTING:
                     sources_used=0
                 )
             
-            # Build context from knowledge base
-            knowledge_context = await rag_service.build_context(
-                query=request.message,
-                max_results=3
-            )
-            if knowledge_context:
-                system_prompt += f"\n\n{knowledge_context}"
+            # Build context from search results (reuse results, don't search again!)
+            if search_results:
+                context_parts = []
+                for idx, result in enumerate(search_results, 1):
+                    text = result["text"]
+                    score = result["score"]
+                    context_parts.append(f"[Sumber {idx}] (Relevansi: {score:.2f})\n{text}")
+                
+                knowledge_context = "\n\n".join(context_parts)
+                system_prompt += f"\n\nInformasi dari knowledge base:\n\n{knowledge_context}"
         except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
             print(f"RAG search error: {e}")
+            print(f"RAG search error details:\n{error_details}")
             # If RAG fails, also reject to be safe
             return ChatResponse(
                 response="Maaf, sistem sedang mengalami kendala. Silakan coba lagi atau hubungi Dinsosnakertrans Kota Yogyakarta.",
@@ -249,7 +268,41 @@ async def webhook_message(webhook_data: WebhookMessage, db: Session = Depends(ge
     Webhook endpoint for n8n to send messages from WhatsApp/Instagram
     n8n will call this endpoint when a message is received
     """
+    print(f"Webhook received: user_id={webhook_data.user_id}, platform={webhook_data.platform}, message='{webhook_data.message[:50] if len(webhook_data.message) > 50 else webhook_data.message}...'")
     try:
+        # Deduplication: Check if we've processed this exact message recently (within 30 seconds)
+        cache_key = None
+        if redis_client:
+            message_fingerprint = hashlib.md5(
+                f"{webhook_data.user_id}:{webhook_data.platform}:{webhook_data.message}".encode()
+            ).hexdigest()
+            cache_key = f"msg:{message_fingerprint}"
+            
+            # Check if message was recently processed (using SETNX to handle race conditions)
+            cached_response = redis_client.get(cache_key)
+            if cached_response and cached_response != "processing":
+                print(f"Duplicate message detected for {webhook_data.user_id}, returning cached response")
+                import json
+                try:
+                    return json.loads(cached_response)
+                except:
+                    pass  # If JSON parsing fails, continue processing
+            
+            # Try to acquire lock (set if not exists) - prevents concurrent processing
+            lock_acquired = redis_client.set(cache_key, "processing", ex=30, nx=True)
+            if not lock_acquired:
+                # Another request is processing, wait a bit and check again
+                import asyncio
+                await asyncio.sleep(0.5)
+                cached_response = redis_client.get(cache_key)
+                if cached_response and cached_response != "processing":
+                    print(f"Duplicate message detected (after wait) for {webhook_data.user_id}, returning cached response")
+                    import json
+                    try:
+                        return json.loads(cached_response)
+                    except:
+                        pass  # If JSON parsing fails, continue processing
+        
         # Create chat request (knowledge base always enforced)
         chat_request = ChatRequest(
             user_id=webhook_data.user_id,
@@ -261,7 +314,7 @@ async def webhook_message(webhook_data: WebhookMessage, db: Session = Depends(ge
         # Process the message
         response = await chat(chat_request, db)
         
-        return {
+        result = {
             "status": "success",
             "user_id": webhook_data.user_id,
             "platform": webhook_data.platform,
@@ -270,7 +323,18 @@ async def webhook_message(webhook_data: WebhookMessage, db: Session = Depends(ge
             "timestamp": response.timestamp
         }
         
+        # Cache the response for deduplication (30 seconds)
+        if redis_client and cache_key:
+            import json
+            redis_client.setex(cache_key, 30, json.dumps(result))
+        
+        return result
+        
     except Exception as e:
+        # Clear processing flag on error so it can be retried
+        if redis_client and cache_key:
+            redis_client.delete(cache_key)
+        print(f"Webhook error: {e}")
         raise HTTPException(status_code=500, detail=f"Webhook error: {str(e)}")
 
 
